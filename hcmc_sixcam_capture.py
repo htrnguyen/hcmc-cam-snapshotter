@@ -1,25 +1,32 @@
-"""
-HCMC 6-CAM CAPTURE (PRO)
+# hcmc_sixcam_capture.py
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 
-- Mỗi lần chạy xử lý đúng 6 camera cố định (đọc từ 1 file chunk).
-- Chu kỳ 15 giây: chụp 6 cam theo mô hình 2+2+2 (subslots) để tránh bị chặn.
-- BẮT BUỘC truy cập expand_url bằng Playwright; lấy ảnh đang hiển thị (img lớn nhất).
+"""
+HCMC 6-CAM CAPTURE — headful debug & mở 6 tab cùng lúc
+
+- Đọc đúng 6 camera từ 1 file chunk (JSON).
+- Mở CÙNG LÚC 6 TAB (headful khi dùng --headful) và GIỮ NGUYÊN các tab qua nhiều vòng.
+- Mỗi 15 giây (mặc định) chụp 6 cam song song (không chia 2/2/2).
 - Chỉ lưu ảnh tĩnh: nếu nguồn là GIF → ép sang JPEG (frame đầu).
-- Tên file chuyên nghiệp theo giờ Việt Nam:
+- Tên file theo giờ Việt Nam:
     images/<cam_id>__<code_slug>/<YYYYMMDD>/<cam_id>__<code_slug>__<YYYYMMDD>__<HHMMSS>__<hash8>.<ext>
 
-Usage:
+Log:
+- Mặc định: mỗi vòng chỉ in 1 dòng: "HH:MM:SS 6/6"
+- Thêm --debug để in chi tiết từng cam: "HH:MM:SS 5/6  [✓ TTH_33.9] [× cam_xx] ..."
+
+Chạy:
     python hcmc_sixcam_capture.py --chunk-file camera_catalog_chunks/cams_chunk_000.json
-Optional:
-    --interval 15 --offset 0 --headful --page-timeout 20
+
+Chạy (headful + debug):
+    python hcmc_sixcam_capture.py --chunk-file camera_catalog_chunks/cams_chunk_000.json --headful --debug
 """
 
 import asyncio
 import argparse
 import json
 import hashlib
-from socket import timeout
-import time
 import unicodedata
 from pathlib import Path
 from datetime import datetime, timezone, timedelta
@@ -27,10 +34,10 @@ from typing import Dict, Any, List, Optional, Tuple
 from urllib.parse import urlparse
 from io import BytesIO
 
-from playwright.async_api import async_playwright
+from playwright.async_api import async_playwright, Page
 from PIL import Image
 
-# ---------- Timezone: Việt Nam ----------
+# ---------- Timezone VN ----------
 try:
     from zoneinfo import ZoneInfo  # Python 3.9+
 
@@ -54,9 +61,7 @@ def slugify(text: Optional[str]) -> str:
     text = unicodedata.normalize("NFKD", text)
     text = "".join(c for c in text if not unicodedata.combining(c))
     text = text.strip().lower()
-    out = []
-    for ch in text:
-        out.append(ch if (ch.isalnum() or ch in "._- ") else "_")
+    out = [(ch if (ch.isalnum() or ch in "._- ") else "_") for ch in text]
     s = "".join(out).replace(" ", "_")
     while "__" in s:
         s = s.replace("__", "_")
@@ -94,6 +99,7 @@ def force_jpeg_if_gif(
         is_gif = True
     if not is_gif:
         return img_bytes, pick_ext_by_content_type(content_type, url_hint), False
+
     im = Image.open(BytesIO(img_bytes))
     try:
         im.seek(0)
@@ -121,14 +127,14 @@ def build_filepath(
     ext: str,
 ) -> Path:
     d = when_vn.strftime("%Y%m%d")
-    t = when_vn.strftime("%H%M%S")  # HHMMSS theo giờ VN
+    t = when_vn.strftime("%H%M%S")  # HHMMSS (VN)
     h8 = sha256_bytes(img_bytes)[:8]
     folder = save_dir / f"{cam_id}__{code_slug}" / d
     folder.mkdir(parents=True, exist_ok=True)
     return folder / f"{cam_id}__{code_slug}__{d}__{t}__{h8}{ext}"
 
 
-async def get_displayed_img_url(page) -> Optional[str]:
+async def get_displayed_img_url(page: Page) -> Optional[str]:
     try:
         return await page.evaluate(
             """() => {
@@ -146,7 +152,7 @@ async def get_displayed_img_url(page) -> Optional[str]:
 
 
 async def fetch_img_bytes(
-    page, img_url: str, referer: str, timeout_s: int
+    page: Page, img_url: str, referer: str, timeout_s: int
 ) -> Tuple[Optional[bytes], Optional[str]]:
     try:
         resp = await page.context.request.get(
@@ -169,68 +175,64 @@ async def fetch_img_bytes(
     return None, None
 
 
-async def capture_one(
-    context, cam: Dict[str, Any], page_timeout: int, save_dir: Path, gif_retry: int
-) -> Dict[str, Any]:
+# ---------- Init 6 tabs & keep them ----------
+async def init_six_pages(
+    context, cams: List[Dict[str, Any]], page_timeout: int
+) -> List[Tuple[Dict[str, Any], Page]]:
+    pages: List[Page] = []
+    for _ in range(len(cams)):
+        p = await context.new_page()
+        pages.append(p)
+    # goto all at once
+    await asyncio.gather(
+        *[
+            p.goto(c["expand_url"], wait_until="domcontentloaded")
+            for p, c in zip(pages, cams)
+        ]
+    )
+    # small settle to avoid GIF loading at first view
+    await asyncio.sleep(2.5)
+    return list(zip(cams, pages))
+
+
+async def capture_on_open_page(
+    pair: Tuple[Dict[str, Any], Page], save_dir: Path, page_timeout: int
+) -> Tuple[bool, str]:
+    """
+    Chụp ảnh ngay trên tab đã mở. Trả (ok, label_for_debug)
+    """
+    cam, page = pair
     cam_id = cam.get("cam_id") or "unknown"
     code = cam.get("code") or cam.get("title") or "nocode"
-    title = cam.get("title") or "untitled"
-    expand = cam.get("expand_url")
     code_slug = slugify(code)
+    expand = cam.get("expand_url") or ""
 
-    result = {
-        "cam_id": cam_id,
-        "code": code,
-        "title": title,
-        "ok": False,
-        "file_path": None,
-        "error": None,
-    }
-    if not expand:
-        result["error"] = "Missing expand_url"
-        return result
-
-    page = await context.new_page()
-    try:
-        await page.goto(expand, wait_until="domcontentloaded")
-        # Tránh GIF loading ban đầu
-        await asyncio.sleep(2.5)
-
+    # lấy URL ảnh đang hiển thị; nếu rỗng → thử thêm 1 lần
+    img_url = await get_displayed_img_url(page)
+    if not img_url:
+        await asyncio.sleep(1.5)
         img_url = await get_displayed_img_url(page)
         if not img_url:
-            await asyncio.sleep(1.5)
-            img_url = await get_displayed_img_url(page)
-            if not img_url:
-                result["error"] = "No displayed image"
-                return result
+            return False, code_slug
 
+    # fetch bytes (1 retry nếu lỗi)
+    b, ct = await fetch_img_bytes(page, img_url, expand, page_timeout)
+    if not b:
+        await asyncio.sleep(1.5)
+        img_url = await get_displayed_img_url(page) or img_url
         b, ct = await fetch_img_bytes(page, img_url, expand, page_timeout)
-        if (not b) and gif_retry:
-            await asyncio.sleep(2.0)
-            img_url = await get_displayed_img_url(page) or img_url
-            b, ct = await fetch_img_bytes(page, img_url, expand, page_timeout)
-
         if not b:
-            result["error"] = "Fetch image failed"
-            return result
+            return False, code_slug
 
-        b2, ext, _ = force_jpeg_if_gif(b, ct, img_url)
-        ts_vn = now_vn()
-        fpath = build_filepath(save_dir, cam_id, code_slug, ts_vn, b2, ext)
-        fpath.write_bytes(b2)
-        result["ok"] = True
-        result["file_path"] = str(fpath)
-        print(f"[OK] {title} -> {result['file_path']}")
-        return result
-    except Exception as e:
-        result["error"] = str(e)
-        print(f"[ERR] {title} -> {result['error']}")
-        return result
-    finally:
-        await page.close()
+    # ép GIF → JPEG nếu cần rồi lưu
+    b2, ext, _ = force_jpeg_if_gif(b, ct, img_url)
+    ts_vn = now_vn()
+    fpath = build_filepath(save_dir, cam_id, code_slug, ts_vn, b2, ext)
+    fpath.write_bytes(b2)
+    return True, code_slug
 
 
-# ---------- Runner (2+2+2 per 15s) ----------
+# ---------- Runner: 6 tabs parallel each cycle ----------
 async def run_loop(
     cams: List[Dict[str, Any]],
     interval: float,
@@ -238,15 +240,21 @@ async def run_loop(
     page_timeout: int,
     headless: bool,
     save_dir: Path,
+    debug: bool,
 ):
-    # Giữ đúng 6 cam
-    cams = cams[:6]
-
-    subslots = [(0.0, 2), (5.0, 2), (10.0, 2)]  # (delay, count)
+    cams = cams[:6]  # ensure exactly 6 (or less if file smaller)
 
     async with async_playwright() as pw:
-        browser = await pw.chromium.launch(headless=headless)
-        # Dùng 1 context chung để giữ cookies & giảm overhead
+        browser = await pw.chromium.launch(
+            headless=not headless is False and not headless
+        )  # not used; set via param below
+        # Actually respect headful flag:
+        await browser.close()
+
+    async with async_playwright() as pw:
+        browser = await pw.chromium.launch(
+            headless=not headless
+        )  # headful if --headful
         context = await browser.new_context(
             user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome Safari",
             extra_http_headers={
@@ -259,46 +267,52 @@ async def run_loop(
         )
         context.set_default_timeout(page_timeout * 1000)
 
-        # Pre-warm cookie
+        # Prewarm cookies
         try:
-            p = await context.new_page()
-            await p.goto(
+            p0 = await context.new_page()
+            await p0.goto(
                 "https://giaothong.hochiminhcity.gov.vn/Map.aspx",
                 wait_until="domcontentloaded",
             )
-            await p.close()
+            await p0.close()
         except Exception:
             pass
+
+        # Open 6 tabs once and keep them
+        cam_pages = await init_six_pages(context, cams, page_timeout)
 
         if offset > 0:
             await asyncio.sleep(offset)
 
         try:
             while True:
-                t0 = time.perf_counter()
-                idx = 0
+                start = asyncio.get_event_loop().time()
+                ts_label = now_vn().strftime("%H:%M:%S")
 
-                for delay, cnt in subslots:
-                    # chờ tới mốc subslot
-                    remaining = delay - (time.perf_counter() - t0)
-                    if remaining > 0:
-                        await asyncio.sleep(remaining)
+                # capture all 6 in parallel
+                tasks = [
+                    asyncio.create_task(
+                        capture_on_open_page(cp, save_dir, page_timeout)
+                    )
+                    for cp in cam_pages
+                ]
+                results = await asyncio.gather(*tasks)
+                ok_total = sum(1 for ok, _ in results if ok)
 
-                    batch = cams[idx : idx + cnt]
-                    idx += cnt
+                if debug:
+                    # compact per-cam marks
+                    parts = []
+                    for ok, label in results:
+                        lab = label[:12] if label else "cam"  # shorten
+                        parts.append(f"[{'✓' if ok else '×'} {lab}]")
+                    print(f"{ts_label} {ok_total}/6", *parts)
+                else:
+                    print(f"{ts_label} {ok_total}/6")
 
-                    tasks = [
-                        asyncio.create_task(
-                            capture_one(context, c, page_timeout, save_dir, gif_retry=1)
-                        )
-                        for c in batch
-                    ]
-                    await asyncio.gather(*tasks)
-
-                # ngủ đến hết chu kỳ
-                elapsed = time.perf_counter() - t0
-                sleep_left = max(0.0, interval - elapsed)
-                await asyncio.sleep(sleep_left)
+                # sleep to complete the interval
+                elapsed = asyncio.get_event_loop().time() - start
+                to_sleep = max(0.0, interval - elapsed)
+                await asyncio.sleep(to_sleep)
         except KeyboardInterrupt:
             pass
         finally:
@@ -309,25 +323,32 @@ async def run_loop(
 # ---------- CLI ----------
 def main():
     ap = argparse.ArgumentParser(
-        description="HCMC 6-cam capture (expand_url → static image)"
+        description="HCMC 6-cam capture (6 tabs parallel, headful debug)"
     )
+    ap.add_argument("--chunk-file", required=True, help="JSON chứa đúng 6 camera")
     ap.add_argument(
-        "--chunk-file", required=True, help="JSON chứa đúng 6 camera (tạo từ split)"
+        "--interval", type=float, default=15.0, help="Chu kỳ chụp (giây), mặc định 15"
     )
-    ap.add_argument("--interval", type=float, default=15.0, help="Chu kỳ chụp (giây)")
     ap.add_argument(
         "--offset",
         type=float,
         default=0.0,
-        help="Trễ khởi động (giây) để so-le giữa các chunk",
+        help="Trễ khởi động (giây) để so-le giữa các runner",
     )
     ap.add_argument(
         "--page-timeout", type=int, default=20, help="Timeout tải ảnh (giây)"
     )
     ap.add_argument(
-        "--headful", action="store_true", help="Mở trình duyệt có giao diện (debug)"
+        "--headful",
+        action="store_true",
+        help="Mở trình duyệt có giao diện (debug trực quan)",
     )
-    ap.add_argument("--save-dir", default="images", help="Thư mục lưu ảnh")
+    ap.add_argument(
+        "--save-dir", default="images", help="Thư mục lưu ảnh (mặc định ./images)"
+    )
+    ap.add_argument(
+        "--debug", action="store_true", help="In log chi tiết từng cam trong mỗi vòng"
+    )
     args = ap.parse_args()
 
     save_dir = Path(args.save_dir)
@@ -338,7 +359,7 @@ def main():
         raise SystemExit("Chunk rỗng.")
     if len(cams) != 6:
         print(
-            f"[WARN] File {args.chunk_file} có {len(cams)} cam (không phải 6). Vẫn chạy với số hiện có."
+            f"[WARN] {args.chunk_file} có {len(cams)} cam (không phải 6). Vẫn chạy với số hiện có."
         )
 
     asyncio.run(
@@ -346,13 +367,10 @@ def main():
             cams=cams,
             interval=args.interval,
             offset=args.offset,
-            page_timeout=(
-                args.page - timeout
-                if hasattr(args, "page-timeout")
-                else args.page_timeout
-            ),  # safeguard
-            headless=not args.headful,
+            page_timeout=args.page_timeout,
+            headless=args.headful,  # True => headful
             save_dir=save_dir,
+            debug=args.debug,
         )
     )
 

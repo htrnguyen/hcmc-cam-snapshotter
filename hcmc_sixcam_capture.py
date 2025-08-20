@@ -1,4 +1,4 @@
-# hcmc_sixcam_capture.py (tối giản + debug console)
+# hcmc_sixcam_capture.py
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 

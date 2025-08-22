@@ -1,8 +1,15 @@
 # Ignore all JSON files
 *.json
 
+# SQL files and database files
+sqlite_dataset/
+*.sql
+*.sqlite
+
+
 # Ignore images folder and all image files
 images/
+images_export/
 *.jpg
 *.jpeg
 *.png
